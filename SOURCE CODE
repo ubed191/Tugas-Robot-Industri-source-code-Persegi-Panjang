@@ -1,0 +1,184 @@
+import math
+
+import rclpy
+from geometry_msgs.msg import Twist
+from rclpy.node import Node
+
+
+class RectangleMover(Node):
+    def __init__(self):
+        super().__init__('rectangle_mover')
+
+        # Ukuran lintasan.
+        self.sisi_panjang = 4.0  # meter
+        self.sisi_pendek = 2.0   # meter
+
+        # Kecepatan berubah bertahap agar robot tidak tersentak/getar.
+        self.kecepatan_maju = 0.20       # m/s
+        self.kecepatan_putar = 0.30      # rad/s
+        self.percepatan_maju = 0.15      # m/s^2
+        self.percepatan_putar = 0.30     # rad/s^2
+        self.jeda = 0.50                 # detik
+        self.toleransi = 0.03            # m atau radian
+
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.gerakan = [
+            ('Maju sisi panjang 1', 'maju', self.sisi_panjang),
+            ('Rotasi 90 derajat 1', 'putar', math.pi / 2.0),
+            ('Maju sisi pendek 1', 'maju', self.sisi_pendek),
+            ('Rotasi 90 derajat 2', 'putar', math.pi / 2.0),
+            ('Maju sisi panjang 2', 'maju', self.sisi_panjang),
+            ('Rotasi 90 derajat 3', 'putar', math.pi / 2.0),
+            ('Maju sisi pendek 2', 'maju', self.sisi_pendek),
+            ('Rotasi 90 derajat terakhir', 'putar', math.pi / 2.0),
+        ]
+
+        self.indeks = 0
+        self.progres = 0.0
+        self.linear_sekarang = 0.0
+        self.angular_sekarang = 0.0
+        self.sedang_jeda = False
+        self.selesai = False
+
+        self.waktu_sebelumnya = self.get_clock().now()
+        self.waktu_mulai_jeda = self.waktu_sebelumnya
+
+        # Mengirim perintah dengan frekuensi tetap 20 Hz.
+        self.timer = self.create_timer(0.05, self.kontrol_robot)
+        self.get_logger().info(self.gerakan[0][0])
+
+    @staticmethod
+    def dekati(nilai, target, perubahan_maksimum):
+        """Mengubah nilai menuju target tanpa lonjakan."""
+        if nilai < target:
+            return min(nilai + perubahan_maksimum, target)
+        return max(nilai - perubahan_maksimum, target)
+
+    def kontrol_robot(self):
+        sekarang = self.get_clock().now()
+        dt = (sekarang - self.waktu_sebelumnya).nanoseconds / 1e9
+        self.waktu_sebelumnya = sekarang
+
+        # Mencegah lonjakan saat simulasi sempat berhenti atau lag.
+        if dt <= 0.0 or dt > 0.20:
+            dt = 0.05
+
+        if self.selesai:
+            self.kirim_perintah(0.0, 0.0)
+            return
+
+        if self.sedang_jeda:
+            self.linear_sekarang = self.dekati(
+                self.linear_sekarang, 0.0, self.percepatan_maju * dt
+            )
+            self.angular_sekarang = self.dekati(
+                self.angular_sekarang, 0.0, self.percepatan_putar * dt
+            )
+            self.kirim_perintah(self.linear_sekarang, self.angular_sekarang)
+
+            lama_jeda = (sekarang - self.waktu_mulai_jeda).nanoseconds / 1e9
+            if lama_jeda >= self.jeda:
+                self.sedang_jeda = False
+                self.progres = 0.0
+                self.get_logger().info(self.gerakan[self.indeks][0])
+            return
+
+        _, jenis, target_jarak = self.gerakan[self.indeks]
+        sisa = max(target_jarak - self.progres, 0.0)
+
+        if jenis == 'maju':
+            jarak_pengereman = (
+                self.linear_sekarang ** 2 / (2.0 * self.percepatan_maju)
+            )
+            target_linear = (
+                0.0
+                if sisa <= jarak_pengereman + self.toleransi
+                else self.kecepatan_maju
+            )
+
+            self.linear_sekarang = self.dekati(
+                self.linear_sekarang,
+                target_linear,
+                self.percepatan_maju * dt,
+            )
+            self.angular_sekarang = self.dekati(
+                self.angular_sekarang,
+                0.0,
+                self.percepatan_putar * dt,
+            )
+            self.progres += abs(self.linear_sekarang) * dt
+            sudah_berhenti = abs(self.linear_sekarang) < 0.005
+
+        else:
+            sudut_pengereman = (
+                self.angular_sekarang ** 2 / (2.0 * self.percepatan_putar)
+            )
+            target_angular = (
+                0.0
+                if sisa <= sudut_pengereman + self.toleransi
+                else self.kecepatan_putar
+            )
+
+            self.linear_sekarang = self.dekati(
+                self.linear_sekarang,
+                0.0,
+                self.percepatan_maju * dt,
+            )
+            self.angular_sekarang = self.dekati(
+                self.angular_sekarang,
+                target_angular,
+                self.percepatan_putar * dt,
+            )
+            self.progres += abs(self.angular_sekarang) * dt
+            sudah_berhenti = abs(self.angular_sekarang) < 0.005
+
+        self.kirim_perintah(self.linear_sekarang, self.angular_sekarang)
+
+        if self.progres >= target_jarak - self.toleransi and sudah_berhenti:
+            self.selesaikan_gerakan(sekarang)
+
+    def selesaikan_gerakan(self, sekarang):
+        self.linear_sekarang = 0.0
+        self.angular_sekarang = 0.0
+        self.kirim_perintah(0.0, 0.0)
+
+        self.indeks += 1
+        if self.indeks >= len(self.gerakan):
+            self.selesai = True
+            self.get_logger().info(
+                'Lintasan persegi panjang selesai. Robot berhenti.'
+            )
+            return
+
+        self.sedang_jeda = True
+        self.waktu_mulai_jeda = sekarang
+
+    def kirim_perintah(self, linear, angular):
+        perintah = Twist()
+        perintah.linear.x = float(linear)
+        perintah.angular.z = float(angular)
+        self.publisher.publish(perintah)
+
+    def berhenti(self):
+        self.linear_sekarang = 0.0
+        self.angular_sekarang = 0.0
+        self.kirim_perintah(0.0, 0.0)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RectangleMover()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.berhenti()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
